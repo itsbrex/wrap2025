@@ -539,15 +539,15 @@ def load_all_data(progress_cb=None) -> dict:
             call_db = snapshot_db(CALL_HISTORY_DB, tmp_dir) if CALL_HISTORY_DB.exists() else None
 
             # Missed calls needing callback (incoming, unanswered, recent, contacts only)
-            # First, get all outgoing calls to know who we've called back
+            # First, get all calls where we connected (outgoing OR answered incoming)
             # Use normalized phone (last 10 digits) as key for consistent matching
-            called_back = {}  # normalized_phone -> latest outgoing call time
+            called_back = {}  # normalized_phone -> latest connected call time
             if call_db:
                 for r in query_db(call_db, f"""
                     SELECT ZADDRESS as phone,
                            datetime(ZDATE + {MAC_EPOCH}, 'unixepoch', 'localtime') as call_time
                     FROM ZCALLRECORD
-                    WHERE ZORIGINATED = 1
+                    WHERE (ZORIGINATED = 1 OR ZANSWERED = 1)
                     AND date(datetime(ZDATE + {MAC_EPOCH}, 'unixepoch', 'localtime')) >= '{cutoff}'"""):
                     phone = r['phone'] or ''
                     call_dt = parse_datetime(r['call_time'])
@@ -591,23 +591,25 @@ def load_all_data(progress_cb=None) -> dict:
             # WhatsApp missed calls
             wa_call_db = snapshot_db(WHATSAPP_CALLS_DB, tmp_dir) if WHATSAPP_CALLS_DB.exists() else None
 
-            # Get WhatsApp outgoing calls for callback check
-            wa_called_back = {}  # jid -> latest outgoing call time
+            # Get WhatsApp connected calls (outgoing OR answered incoming) for callback check
+            # Add to the same called_back dict (normalized) so cross-platform callbacks work
             if wa_call_db:
                 for r in query_db(wa_call_db, f"""
                     SELECT p.ZJIDSTRING as jid,
                            datetime(a.ZFIRSTDATE + {MAC_EPOCH}, 'unixepoch', 'localtime') as call_time
                     FROM ZWAAGGREGATECALLEVENT a
                     JOIN ZWACDCALLEVENTPARTICIPANT p ON p.Z1PARTICIPANTS = a.Z_PK
-                    WHERE a.ZINCOMING = 0
+                    WHERE (a.ZINCOMING = 0 OR a.ZMISSED = 0)
                     AND date(datetime(a.ZFIRSTDATE + {MAC_EPOCH}, 'unixepoch', 'localtime')) >= '{cutoff}'"""):
                     jid = r['jid'] or ''
                     call_dt = parse_datetime(r['call_time'])
                     if jid and call_dt:
-                        # Normalize JID - extract phone number
+                        # Normalize to last 10 digits for consistent matching
                         phone = jid.split('@')[0]
-                        if phone not in wa_called_back or call_dt > wa_called_back[phone]:
-                            wa_called_back[phone] = call_dt
+                        normalized = re.sub(r'[^\d]', '', phone)[-10:]
+                        if normalized and len(normalized) >= 7:
+                            if normalized not in called_back or call_dt > called_back[normalized]:
+                                called_back[normalized] = call_dt
 
             # Get WhatsApp missed calls
             if wa_call_db:
@@ -629,8 +631,10 @@ def load_all_data(progress_cb=None) -> dict:
                     call_dt = parse_datetime(r['call_time'])
                     if not call_dt:
                         continue
-                    # Skip if we called them back after this missed call
-                    if phone in wa_called_back and wa_called_back[phone] > call_dt:
+                    # Skip if we called them back after this missed call (any platform)
+                    # Normalize phone for lookup to match how called_back is keyed
+                    normalized = re.sub(r'[^\d]', '', phone)[-10:]
+                    if normalized in called_back and called_back[normalized] > call_dt:
                         continue
                     call_type = 'WhatsApp Video' if r['video'] else 'WhatsApp'
                     missed_calls.append({
